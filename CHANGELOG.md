@@ -29,7 +29,7 @@
   - 新增 `--debug` 诊断（仅计数，不含敏感值）：footer/数据块/键分布、每 store 实体计数、join 覆盖率。
 
 ### 局限 / Known limitations
-- 凭据覆盖依赖关系连接 host→ssh_config→identity。若某主机引用的 identity 不在 store12 中（已删除）或主机无 `ssh_config`，则该行凭据为空；此为本地数据状态，非读取逻辑缺陷。`local_id` 同时编码在 LevelDB 键中（`[db][store][index] varints` 后 `01 03 [8-byte double LE]`），可作后续扩展连接的依据。
+- 凭据覆盖依赖关系连接 host→ssh_config→identity。已处理：重复记录按完整度去重、`content` 同步载荷只合并非凭据字段（避免 stale sync 把账号密码错位覆盖）、`local_id` 缺失时从 LevelDB 键恢复（`01 03 [8-byte double LE]`，仅对非 config store 补齐以免 store4/store9 共享 local_id 空间误匹配）。仍可能：某主机引用的 identity 已从 DB 删除、或主机无 `ssh_config`（telnet/cloud），则该行凭据为空——此为本地数据状态，非读取逻辑缺陷。
 
 ### 未改动 / Unchanged
 - `termius-importer.js`、`HOW_TO_IMPORT.md`、`README.md`、`package.json`（无新依赖，Snappy 内置，libsodium/keytar 已存在）。

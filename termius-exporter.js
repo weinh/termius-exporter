@@ -149,6 +149,7 @@ async function buildModel(key, debug) {
 
   const byStore = new Map(); // storeId -> { byLocal, byId, list }
   let objects = 0;
+  const completeness = (o) => { let n = 0; for (const v of Object.values(o)) if (v != null && v !== '') n++; return n; };
 
   // Decrypt an encrypted value blob (raw 0x04-prefixed, or a base64 run inside the
   // value) to its cleartext bytes, or null.
@@ -175,8 +176,11 @@ async function buildModel(key, debug) {
     const kb = Buffer.from(kStr, 'latin1');
     let off = 0;
     for (let i = 0; i < 3; i++) { const v = leveldb.readVarint(kb, off); off = v.next; }
-    for (const skip of [2, 1, 3, 0]) {
+    // IDB number key: a 0x03 tag immediately precedes the 8-byte double LE; a 1-byte
+    // array marker may sit before that. Require the tag to avoid garbage matches.
+    for (const skip of [2, 1, 3]) {
       if (off + skip + 8 > kb.length) continue;
+      if (kb[off + skip - 1] !== 0x03) continue;
       const dv = kb.readDoubleLE(off + skip);
       if (Number.isInteger(dv) && dv > 0 && dv < 1e9) return dv;
     }
@@ -194,22 +198,22 @@ async function buildModel(key, debug) {
     // V8 structured-clone; a few are stored only as encrypted sync-blobs. Index/string
     // refs don't deserialize to objects and are skipped naturally.
     let o = leveldb.deserializeValue(val);
-    let lidFromKey = null;
 
-    if (!o) { // encrypted-blob entity: decrypt value, recover local_id from the key
+    if (!o) { // encrypted-blob entity: decrypt value
       const d = openBlob(val);
       if (d) {
         try { o = JSON.parse(d.toString('utf8')); } catch {}
         if (!o) o = leveldb.deserializeValue(d);
-        if (looksEntity(o)) lidFromKey = localIdFromKey(kStr);
-        else o = null;
+        if (!looksEntity(o)) o = null;
       }
     }
     if (!o || typeof o !== 'object' || Array.isArray(o)) continue;
 
-    // The `content` field is an encrypted sync payload holding the canonical (current)
-    // field values; the plaintext object's fields can be empty/stale. Decrypt it and
-    // merge over `o` so port / username / password / private_key etc. are authoritative.
+    // The `content` field is an encrypted sync payload. It can carry current values
+    // for non-sensitive fields (port, address, label), but for failed-sync entities
+    // (status CREATE_FAILED etc.) it reflects a STALE sync and must NOT overwrite the
+    // current local credentials/refs — otherwise usernames/passwords end up swapped
+    // onto the wrong host. Merge only non-credential, non-ref fields.
     if (typeof o.content === 'string' && o.content) {
       const cd = Buffer.from(o.content, 'base64');
       if (cd.length >= 28 && cd[0] === 4) {
@@ -220,7 +224,10 @@ async function buildModel(key, debug) {
           try { c = JSON.parse(pt.toString('utf8')); } catch {}
           if (!c) c = leveldb.deserializeValue(pt);
           if (c && typeof c === 'object' && !Array.isArray(c)) {
-            for (const f of Object.keys(c)) if (f !== 'content') o[f] = c[f];
+            const skip = new Set(['content', 'username', 'password', 'private_key',
+              'passphrase', 'public_key', 'ssh_key', 'identity', 'ssh_config',
+              'local_id', 'id', 'status']);
+            for (const f of Object.keys(c)) if (!skip.has(f)) o[f] = c[f];
           }
         } catch {}
       }
@@ -228,11 +235,35 @@ async function buildModel(key, debug) {
 
     objects++;
     let idx = byStore.get(p.storeId);
-    if (!idx) { idx = { byLocal: new Map(), byId: new Map(), list: [] }; byStore.set(p.storeId, idx); }
-    const lid = o.local_id != null ? o.local_id : lidFromKey;
-    if (lid != null) idx.byLocal.set(lid, o);
-    if (o.id != null) idx.byId.set(o.id, o);
-    idx.list.push(o);
+    if (!idx) { idx = { byLocal: new Map(), byKeyLocal: new Map(), byId: new Map(), noLocal: [] }; byStore.set(p.storeId, idx); }
+    if (o.local_id != null) {
+      // Dedup duplicate records (same local_id — e.g. a data record plus a stale index
+      // copy): keep the most complete one so a half-empty copy can't shadow the real
+      // host and drop its ssh_config/credentials.
+      const prev = idx.byLocal.get(o.local_id);
+      if (!prev || completeness(o) > completeness(prev)) idx.byLocal.set(o.local_id, o);
+    } else {
+      // local_id may be encoded only in the LevelDB key (`.. 0x03 <8-byte double LE>`).
+      // Stash these separately so they only FILL gaps — never overwrite a canonical
+      // value-local_id record that happens to share the id.
+      const kId = localIdFromKey(kStr);
+      if (kId != null) {
+        const prev = idx.byKeyLocal.get(kId);
+        if (!prev || completeness(o) > completeness(prev)) idx.byKeyLocal.set(kId, o);
+      } else {
+        idx.noLocal.push(o);
+      }
+    }
+    if (o.id != null && !idx.byId.has(o.id)) idx.byId.set(o.id, o);
+  }
+  for (const [sid, idx] of byStore) {
+    // Gap-fill key-local_id records only for non-config stores. store4/store9 share a
+    // local_id space, so filling one from the key would intercept refs meant for the
+    // other and mis-resolve credentials.
+    if (sid !== STORE.SSH_CONFIG && sid !== STORE.SSH_CONFIG2) {
+      for (const [lid, obj] of idx.byKeyLocal) if (!idx.byLocal.has(lid)) idx.byLocal.set(lid, obj);
+    }
+    idx.list = [...idx.byLocal.values(), ...idx.noLocal];
   }
 
   if (debug) {
@@ -403,7 +434,11 @@ async function main() {
   console.log(`Output: ${OUTPUT_DIR}`);
 }
 
-main().catch(err => {
-  console.error('Error:', err.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(err => {
+    console.error('Error:', err.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { buildModel, lookup, decryptField, buildHostRows, exportHostsCsv, exportSshKeys, exportSnippets, STORE };

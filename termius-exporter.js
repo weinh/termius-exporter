@@ -2,7 +2,7 @@
 /**
  * Termius data exporter
  *
- * Extracts and decrypts all data from the local Termius database.
+ * Extracts and decrypts all data from the local Termius IndexedDB (LevelDB) store.
  * Output: termius_hosts.csv, ssh_keys/, snippets.csv
  *
  * Requires: npm install libsodium-wrappers keytar
@@ -13,6 +13,7 @@ const keytar = require('keytar');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const leveldb = require('./leveldb-read');
 
 const BOM = '﻿';
 const OUTPUT_DIR = __dirname;
@@ -101,97 +102,156 @@ async function getEncryptionKey() {
   throw new Error(
     'Termius encryption key not found.' + found +
     '\n\nManual key fallback:' +
-    '\n  1) Open Keychain Access, search "Termius"' +
-    '\n  2) Double-click the entry → check "Show password", copy the value (~44 char base64)' +
+    '\n  1) Open Keychain Access / Credential Manager, search "Termius"' +
+    '\n  2) Copy the password value (~44 char base64)' +
     '\n  3) Re-run:  TERMIUS_KEY=\'<value>\' node termius-exporter.js' +
     '\n     or:     node termius-exporter.js --key=\'<value>\''
   );
 }
 
-async function decrypt(base64Data, key) {
-  const data = Buffer.from(base64Data, 'base64');
-  if (data[0] !== 4) return null;
-
-  const nonce = data.slice(2, 26);
-  const ciphertext = data.slice(26);
-
+// Decrypt a single encrypted field value. Termius stores most entities as plaintext
+// V8 structured-clone objects, with only the credential fields (password, private_key,
+// passphrase, sometimes username) encrypted as base64 `version+options+nonce+ciphertext`
+// strings. Returns the cleartext, or the original value if it isn't an encrypted blob.
+function decryptField(v, key) {
+  if (typeof v !== 'string' || !v) return v == null ? '' : v;
+  const d = Buffer.from(v, 'base64');
+  if (d.length < 28 || d[0] !== 4) return v;
   try {
-    const decrypted = sodium.crypto_secretbox_open_easy(
-      new Uint8Array(ciphertext),
-      new Uint8Array(nonce),
-      new Uint8Array(key)
-    );
-    return Buffer.from(decrypted).toString('utf8');
-  } catch {
-    return null;
-  }
+    const pt = sodium.crypto_secretbox_open_easy(
+      new Uint8Array(d.slice(26)), new Uint8Array(d.slice(2, 26)), new Uint8Array(key));
+    return Buffer.from(pt).toString('utf8');
+  } catch { return v; }
 }
 
-async function extractAndDecrypt(key) {
+// ==================== Model ====================
+
+// Object-store ids in this Termius IndexedDB:
+//   4/9  ssh connection configs (port, identity ref)
+//   11   SSH keys (label, private_key, passphrase)
+//   12   identities (username, password, ssh_key ref)
+//   13   snippets (label, script)
+//   16   hosts (address, label, ssh_config ref, group ref, os_name)
+//   15   groups (label, parent_group)
+const STORE = { SSH_CONFIG: 4, SSH_CONFIG2: 9, KEY: 11, IDENTITY: 12, SNIPPET: 13, HOST: 16, GROUP: 15 };
+
+// Read every current object-store DATA record (index_id == 0), deserialize it (V8
+// structured-clone, falling back to whole-record encrypted JSON for the few stores that
+// use it), and index by store + local_id + id for relational joins.
+async function buildModel(key, debug) {
   const dbPath = getDbPath();
   if (!fs.existsSync(dbPath)) {
     throw new Error(`Termius database not found at: ${dbPath}`);
   }
 
-  const files = fs.readdirSync(dbPath).filter(f => f.endsWith('.log') || f.endsWith('.ldb'));
+  const current = leveldb.readCurrentValues(dbPath, { debug });
+  console.log(`Found ${current.size} current records (post-tombstone)`);
 
-  // 'binary' (latin1) is lossless for arbitrary bytes — 'utf8' silently corrupts binary data
-  let allData = '';
-  files.forEach(f => {
-    allData += fs.readFileSync(path.join(dbPath, f)).toString('binary');
-  });
+  const byStore = new Map(); // storeId -> { byLocal, byId, list }
+  let objects = 0;
 
-  const encrypted = [...new Set(allData.match(/BA[A-Za-z0-9+/=]{30,}/g) || [])];
-  console.log(`Found ${encrypted.length} encrypted blocks`);
+  // Decrypt an encrypted value blob (raw 0x04-prefixed, or a base64 run inside the
+  // value) to its cleartext bytes, or null.
+  const openBlob = (val) => {
+    let d = null;
+    if (val[0] === 4) {
+      try { d = Buffer.from(sodium.crypto_secretbox_open_easy(new Uint8Array(val.slice(26)), new Uint8Array(val.slice(2, 26)), new Uint8Array(key))); } catch {}
+    }
+    if (!d) {
+      const runs = val.toString('latin1').match(/[A-Za-z0-9+/]{44,}={0,2}/g) || [];
+      for (const r of runs) {
+        const b = Buffer.from(r, 'base64');
+        if (b[0] !== 4) continue;
+        try { d = Buffer.from(sodium.crypto_secretbox_open_easy(new Uint8Array(b.slice(26)), new Uint8Array(b.slice(2, 26)), new Uint8Array(key))); } catch {}
+        if (d) break;
+      }
+    }
+    return d;
+  };
+  // Some entities are stored only as an encrypted sync-blob (no V8 object), with their
+  // local_id encoded in the LevelDB key as a number: after the [db][store][index]
+  // varints, the user key is `[arrayLen?][0x03][8-byte double LE]`. Probe offsets.
+  const localIdFromKey = (kStr) => {
+    const kb = Buffer.from(kStr, 'latin1');
+    let off = 0;
+    for (let i = 0; i < 3; i++) { const v = leveldb.readVarint(kb, off); off = v.next; }
+    for (const skip of [2, 1, 3, 0]) {
+      if (off + skip + 8 > kb.length) continue;
+      const dv = kb.readDoubleLE(off + skip);
+      if (Number.isInteger(dv) && dv > 0 && dv < 1e9) return dv;
+    }
+    return null;
+  };
+  const looksEntity = (o) => o && (o.username !== undefined || o.password !== undefined
+    || o.private_key !== undefined || o.script !== undefined || o.address !== undefined
+    || o.host !== undefined);
 
-  const results = [];
-  for (const e of encrypted) {
-    const dec = await decrypt(e, key);
-    if (dec) results.push(dec);
+  for (const [kStr, val] of current) {
+    let p;
+    try { p = leveldb.decodeIdbKeyPrefix(Buffer.from(kStr, 'latin1')); }
+    catch { continue; }
+    // Entities (hosts, identities, keys, snippets, configs) are stored as plaintext
+    // V8 structured-clone; a few are stored only as encrypted sync-blobs. Index/string
+    // refs don't deserialize to objects and are skipped naturally.
+    let o = leveldb.deserializeValue(val);
+    let lidFromKey = null;
+
+    if (!o) { // encrypted-blob entity: decrypt value, recover local_id from the key
+      const d = openBlob(val);
+      if (d) {
+        try { o = JSON.parse(d.toString('utf8')); } catch {}
+        if (!o) o = leveldb.deserializeValue(d);
+        if (looksEntity(o)) lidFromKey = localIdFromKey(kStr);
+        else o = null;
+      }
+    }
+    if (!o || typeof o !== 'object' || Array.isArray(o)) continue;
+
+    // The `content` field is an encrypted sync payload holding the canonical (current)
+    // field values; the plaintext object's fields can be empty/stale. Decrypt it and
+    // merge over `o` so port / username / password / private_key etc. are authoritative.
+    if (typeof o.content === 'string' && o.content) {
+      const cd = Buffer.from(o.content, 'base64');
+      if (cd.length >= 28 && cd[0] === 4) {
+        try {
+          const pt = Buffer.from(sodium.crypto_secretbox_open_easy(
+            new Uint8Array(cd.slice(26)), new Uint8Array(cd.slice(2, 26)), new Uint8Array(key)));
+          let c = null;
+          try { c = JSON.parse(pt.toString('utf8')); } catch {}
+          if (!c) c = leveldb.deserializeValue(pt);
+          if (c && typeof c === 'object' && !Array.isArray(c)) {
+            for (const f of Object.keys(c)) if (f !== 'content') o[f] = c[f];
+          }
+        } catch {}
+      }
+    }
+
+    objects++;
+    let idx = byStore.get(p.storeId);
+    if (!idx) { idx = { byLocal: new Map(), byId: new Map(), list: [] }; byStore.set(p.storeId, idx); }
+    const lid = o.local_id != null ? o.local_id : lidFromKey;
+    if (lid != null) idx.byLocal.set(lid, o);
+    if (o.id != null) idx.byId.set(o.id, o);
+    idx.list.push(o);
   }
 
-  const pct = encrypted.length > 0 ? (results.length / encrypted.length * 100).toFixed(1) : '0.0';
-  console.log(`Decrypted: ${results.length}/${encrypted.length} (${pct}%)`);
-  return results;
+  if (debug) {
+    console.log(`    Deserialized ${objects} entity objects across ${byStore.size} stores:`);
+    for (const [sid, idx] of [...byStore.entries()].sort((a, b) => a[0] - b[0])) {
+      console.log(`      store${sid}: ${idx.list.length}`);
+    }
+  }
+  return { byStore };
 }
 
-// ==================== Parsing ====================
-
-function parseDecryptedData(results) {
-  const identitiesByUser = new Map();
-  const keysByLabel = new Map();
-  const keysById = new Map();
-  const connections = [];
-  const snippets = new Map();
-
-  results.forEach(d => {
-    if (!d.startsWith('{')) return;
-    try {
-      const obj = JSON.parse(d);
-
-      if (obj.username !== undefined && obj.password !== undefined) {
-        const mapKey = obj.label || obj.username;
-        if (!identitiesByUser.has(mapKey) || obj.password) {
-          identitiesByUser.set(mapKey, obj);
-        }
-      }
-
-      if (obj.private_key && obj.label) {
-        keysByLabel.set(obj.label, obj);
-        if (obj.id) keysById.set(obj.id, obj);
-      }
-
-      if (obj.host && obj.user_name && obj.connection_type) {
-        connections.push(obj);
-      }
-
-      if (obj.script && obj.label) {
-        snippets.set(obj.label, obj);
-      }
-    } catch {}
-  });
-
-  return { identitiesByUser, keysByLabel, keysById, connections, snippets };
+// Resolve a {local_id, id} reference to a record in the given store.
+function lookup(model, storeId, refObj) {
+  if (!refObj || typeof refObj !== 'object') return null;
+  const idx = model.byStore.get(storeId);
+  if (!idx) return null;
+  if (refObj.local_id != null && idx.byLocal.has(refObj.local_id)) return idx.byLocal.get(refObj.local_id);
+  if (refObj.id != null && idx.byId.has(refObj.id)) return idx.byId.get(refObj.id);
+  return null;
 }
 
 // ==================== Export ====================
@@ -202,80 +262,103 @@ function escapeCsv(v) {
   return `"${v.replace(/"/g, '""')}"`;
 }
 
-function buildHostConfig(data) {
-  const { identitiesByUser, keysById, connections } = data;
+// host (store16) -> ssh_config (store4/9, port + identity ref) -> identity (store12,
+// username + password) and ssh_key (store11, label). Credentials are encrypted sub-fields.
+function buildHostRows(model, key) {
+  const hosts = (model.byStore.get(STORE.HOST) || { list: [] }).list;
+  const rows = [];
+  const seen = new Set();
+  for (const h of hosts) {
+    if (h.address === undefined) continue; // only host records (store16) carry address
+    // Termius soft-deletes hosts by marking status "DELETE_FAILED" (cloud delete didn't
+    // sync). The record lingers locally and the UI hides it — exclude it so deleted
+    // hosts (e.g. stale "v10") don't reappear in the export.
+    if (typeof h.status === 'string' && /delete/i.test(h.status)) continue;
+    const id = h.local_id != null ? `lid:${h.local_id}`
+      : (h.id != null ? `id:${h.id}` : `${h.label}|${h.address}`);
+    if (seen.has(id)) continue;
+    seen.add(id);
 
-  const hostMap = new Map();
-  connections.forEach(conn => {
-    const key = `${conn.host}:${conn.port}`;
-    if (hostMap.has(key)) return;
+    // ssh_config may resolve to a store4 record (port + identity directly) OR a store9
+    // wrapper that carries its own `ssh_config` ref (-> store4, where port lives) plus
+    // an `identity` ref (-> store12). Unwrap store9 so port and identity both resolve.
+    let cfg = lookup(model, STORE.SSH_CONFIG, h.ssh_config)
+      || lookup(model, STORE.SSH_CONFIG2, h.ssh_config);
+    let portCfg = cfg, identRef = cfg && cfg.identity;
+    if (cfg && cfg.ssh_config && typeof cfg.ssh_config === 'object') {
+      const inner = lookup(model, STORE.SSH_CONFIG, cfg.ssh_config);
+      if (inner) { portCfg = inner; if (identRef == null) identRef = inner.identity; }
+    }
+    let port = portCfg && portCfg.port;
+    if (port && typeof port === 'object') port = port.value ?? port.number ?? null;
+    if (typeof port !== 'number' || !port) port = 22;
 
-    let password = '';
-    identitiesByUser.forEach(id => {
-      if (id.username === conn.user_name && id.password) password = id.password;
-    });
+    const ident = lookup(model, STORE.IDENTITY, identRef);
+    const username = ident ? decryptField(ident.username, key) : '';
+    const password = ident ? decryptField(ident.password, key) : '';
 
     let keyName = '';
-    if (conn.key_id) {
-      const keyObj = keysById.get(conn.key_id);
-      keyName = keyObj ? keyObj.label : `key_id:${conn.key_id}`;
-    }
+    const keyObj = lookup(model, STORE.KEY, ident && ident.ssh_key);
+    if (keyObj) keyName = decryptField(keyObj.label, key) || keyObj.label || '';
 
-    hostMap.set(key, {
-      host: conn.host,
-      port: conn.port,
-      label: conn.title || '',
-      username: conn.user_name,
+    rows.push({
+      label: decryptField(h.label, key) || h.label || '',
+      host: decryptField(h.address, key) || h.address || '',
+      port,
+      username,
       password,
       keyName,
-      os: conn.host_os_name || ''
+      os: decryptField(h.os_name, key) || h.os_name || '',
     });
-  });
-
-  return hostMap;
+  }
+  return rows;
 }
 
-function exportHostsCsv(hostMap) {
+function exportHostsCsv(rows) {
   let csv = 'Label,Host,Port,Username,Password,SSH_Key,OS\n';
-  hostMap.forEach(h => {
+  rows.forEach(h => {
     csv += [h.label, h.host, h.port, h.username, h.password, h.keyName, h.os].map(escapeCsv).join(',') + '\n';
   });
   fs.writeFileSync(path.join(OUTPUT_DIR, 'termius_hosts.csv'), BOM + csv);
-  return hostMap.size;
+  return rows.length;
 }
 
-function exportSshKeys(keysByLabel) {
+function exportSshKeys(model, key) {
+  const keys = (model.byStore.get(STORE.KEY) || { list: [] }).list;
   const keysDir = path.join(OUTPUT_DIR, 'ssh_keys');
   if (!fs.existsSync(keysDir)) fs.mkdirSync(keysDir, { mode: 0o700 });
 
   let count = 0;
-  keysByLabel.forEach((k, label) => {
-    if (!k.private_key) return;
-    const safeName = label.replace(/[<>:"/\\|?*]/g, '_');
+  keys.forEach((k, i) => {
+    if (typeof k.status === 'string' && /delete/i.test(k.status)) return;
+    const pk = decryptField(k.private_key, key);
+    if (!pk) return;
+    const label = decryptField(k.label, key) || k.label || `key_${i}`;
+    const safeName = String(label).replace(/[<>:"/\\|?*]/g, '_');
 
-    let keyContent = k.private_key;
-    if (!keyContent.endsWith('\n')) keyContent += '\n';
+    let content = pk;
+    if (!content.endsWith('\n')) content += '\n';
+    fs.writeFileSync(path.join(keysDir, `${safeName}.pem`), content, { mode: 0o600 });
 
-    const pemPath = path.join(keysDir, `${safeName}.pem`);
-    fs.writeFileSync(pemPath, keyContent, { mode: 0o600 });
-
-    if (k.passphrase) {
-      const ppPath = path.join(keysDir, `${safeName}.passphrase`);
-      fs.writeFileSync(ppPath, k.passphrase, { mode: 0o600 });
-    }
+    const pp = decryptField(k.passphrase, key);
+    if (pp) fs.writeFileSync(path.join(keysDir, `${safeName}.passphrase`), pp, { mode: 0o600 });
     count++;
   });
   return count;
 }
 
-function exportSnippets(snippets) {
+function exportSnippets(model, key) {
+  const snippets = (model.byStore.get(STORE.SNIPPET) || { list: [] }).list;
   let csv = 'Label,Script\n';
-  snippets.forEach((s, label) => {
-    const script = (s.script || '').replace(/"/g, '""').replace(/\n/g, '\\n');
-    csv += `"${label}","${script}"\n`;
+  snippets.forEach(s => {
+    if (s.script === undefined) return; // only snippet records carry a script
+    if (typeof s.status === 'string' && /delete/i.test(s.status)) return;
+    const label = decryptField(s.label, key) || s.label || '';
+    const script = decryptField(s.script, key) || '';
+    csv += [label, script].map(escapeCsv).join(',') + '\n';
   });
   fs.writeFileSync(path.join(OUTPUT_DIR, 'snippets.csv'), BOM + csv);
-  return snippets.size;
+  return snippets.length;
 }
 
 // ==================== Main ====================
@@ -289,26 +372,32 @@ async function main() {
   const key = await getEncryptionKey();
   console.log('    ✓ Key retrieved\n');
 
+  const debug = process.argv.includes('--debug');
+
   console.log('[2/4] Decrypting database...');
-  const results = await extractAndDecrypt(key);
+  const model = await buildModel(key, debug);
   console.log('');
 
-  console.log('[3/4] Parsing data...');
-  const data = parseDecryptedData(results);
-  console.log(`    ✓ Identities: ${data.identitiesByUser.size}`);
-  console.log(`    ✓ SSH keys:   ${data.keysByLabel.size}`);
-  console.log(`    ✓ Connections:${data.connections.length}`);
-  console.log(`    ✓ Snippets:   ${data.snippets.size}\n`);
+  console.log('[3/4] Building host list...');
+  const rows = buildHostRows(model, key);
+  const keysCount = (model.byStore.get(STORE.KEY) || { list: [] }).list.length;
+  const snippetsCount = (model.byStore.get(STORE.SNIPPET) || { list: [] }).list.length;
+  console.log(`    ✓ Hosts:     ${rows.length}`);
+  console.log(`    ✓ SSH keys:  ${keysCount}`);
+  console.log(`    ✓ Snippets:  ${snippetsCount}\n`);
+  if (debug) {
+    const w = (f) => rows.filter(r => r[f]).length;
+    console.log(`    join coverage: ${w('username')}/${rows.length} username, ${w('password')}/${rows.length} password, ${w('keyName')}/${rows.length} key, ${rows.filter(r => r.port !== 22).length} non-22 port\n`);
+  }
 
   console.log('[4/4] Exporting...');
-  const hostMap = buildHostConfig(data);
-  const hostsCount = exportHostsCsv(hostMap);
-  const keysCount = exportSshKeys(data.keysByLabel);
-  const snippetsCount = exportSnippets(data.snippets);
+  const hostsCount = exportHostsCsv(rows);
+  const exportedKeys = exportSshKeys(model, key);
+  const exportedSnippets = exportSnippets(model, key);
 
   console.log(`    ✓ termius_hosts.csv (${hostsCount} hosts)`);
-  console.log(`    ✓ ssh_keys/ (${keysCount} keys)`);
-  console.log(`    ✓ snippets.csv (${snippetsCount} snippets)\n`);
+  console.log(`    ✓ ssh_keys/ (${exportedKeys} keys)`);
+  console.log(`    ✓ snippets.csv (${exportedSnippets} snippets)\n`);
 
   console.log('=== Export complete ===');
   console.log(`Output: ${OUTPUT_DIR}`);

@@ -7,3 +7,4 @@ tmpclaude-*
 ssh_keys/
 snippets.csv
 termius_hosts.csv
+termius_import_ready.csv

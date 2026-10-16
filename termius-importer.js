@@ -26,14 +26,14 @@ async function main() {
   for (const fields of rows.slice(1)) {
     if (fields.length < 2 || fields.every(field => !field)) continue;
 
-    // termius_hosts.csv columns: Label,Host,Port,Username,Password,SSH_Key,OS,Group
-    const [label, host, port, username, password, , , group] = fields.map(f => (f || '').trim());
+    // termius_hosts.csv columns: Label,Host,Port,Username,Password,SSH_Key,OS,Group,Tags
+    const [label, host, port, username, password, , , group, tags] = fields.map(f => (f || '').trim());
 
     // Map to new format
     output += [
       escapeCSV(group),      // Groups (parent/child path from the exporter)
       escapeCSV(label),      // Label
-      "",                    // Tags
+      escapeCSV(tags),       // Tags (comma-separated from the exporter)
       escapeCSV(host),       // Hostname/IP
       "ssh",                 // Protocol
       port || "22",          // Port

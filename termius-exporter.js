@@ -133,7 +133,7 @@ function decryptField(v, key) {
 //   13   snippets (label, script)
 //   16   hosts (address, label, ssh_config ref, group ref, os_name)
 //   15   groups (label, parent_group)
-const STORE = { SSH_CONFIG: 4, SSH_CONFIG2: 9, KEY: 11, IDENTITY: 12, SNIPPET: 13, HOST: 16, GROUP: 15 };
+const STORE = { SSH_CONFIG: 4, SSH_CONFIG2: 9, KEY: 11, IDENTITY: 12, SNIPPET: 13, HOST: 16, GROUP: 15, TAG: 17, HOST_TAG: 18 };
 
 // Read every current object-store DATA record (index_id == 0), deserialize it (V8
 // structured-clone, falling back to whole-record encrypted JSON for the few stores that
@@ -298,6 +298,20 @@ function buildHostRows(model, key) {
   const hosts = (model.byStore.get(STORE.HOST) || { list: [] }).list;
   const rows = [];
   const seen = new Set();
+
+  // store18 is a host<->tag join table: {host: ref, tag: ref}. Group tag refs by host.
+  const hostTags = new Map();
+  const tagLinks = (model.byStore.get(STORE.HOST_TAG) || { list: [] }).list;
+  for (const t of tagLinks) {
+    if (/delete/i.test(t.status || '')) continue;
+    if (t.host && typeof t.host === 'object' && t.host.local_id != null &&
+        t.tag && typeof t.tag === 'object') {
+      const hl = t.host.local_id;
+      if (!hostTags.has(hl)) hostTags.set(hl, []);
+      hostTags.get(hl).push(t.tag);
+    }
+  }
+
   for (const h of hosts) {
     if (h.address === undefined) continue; // only host records (store16) carry address
     // Termius soft-deletes hosts by marking status "DELETE_FAILED" (cloud delete didn't
@@ -353,6 +367,14 @@ function buildHostRows(model, key) {
       groupPath = parts.join('/');
     }
 
+    // Resolve the host's tags via the store18 join table -> store17 tag labels.
+    const tagLabels = [];
+    for (const tr of (hostTags.get(h.local_id) || [])) {
+      const tg = lookup(model, STORE.TAG, tr);
+      if (tg) { const lbl = decryptField(tg.label, key) || tg.label || ''; if (lbl) tagLabels.push(lbl); }
+    }
+    const tags = tagLabels.join(',');
+
     rows.push({
       label: decryptField(h.label, key) || h.label || '',
       host: decryptField(h.address, key) || h.address || '',
@@ -362,15 +384,16 @@ function buildHostRows(model, key) {
       keyName,
       os: decryptField(h.os_name, key) || h.os_name || '',
       group: groupPath,
+      tags,
     });
   }
   return rows;
 }
 
 function exportHostsCsv(rows) {
-  let csv = 'Label,Host,Port,Username,Password,SSH_Key,OS,Group\n';
+  let csv = 'Label,Host,Port,Username,Password,SSH_Key,OS,Group,Tags\n';
   rows.forEach(h => {
-    csv += [h.label, h.host, h.port, h.username, h.password, h.keyName, h.os, h.group].map(escapeCsv).join(',') + '\n';
+    csv += [h.label, h.host, h.port, h.username, h.password, h.keyName, h.os, h.group, h.tags].map(escapeCsv).join(',') + '\n';
   });
   fs.writeFileSync(path.join(OUTPUT_DIR, 'termius_hosts.csv'), BOM + csv);
   return rows.length;

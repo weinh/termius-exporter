@@ -311,19 +311,21 @@ function buildHostRows(model, key) {
     seen.add(id);
 
     // ssh_config may resolve to a store4 record (port + identity directly) OR a store9
-    // wrapper that carries its own `ssh_config` ref (-> store4, where port lives) plus
-    // an `identity` ref (-> store12). Unwrap store9 so port and identity both resolve.
-    let cfg = lookup(model, STORE.SSH_CONFIG, h.ssh_config)
+    // wrapper whose `ssh_config` ref points to the real store4 config. store9.identity
+    // is a denormalized copy that can be stale / cross-referenced; the inner store4
+    // identity is self-consistent, so prefer it for both port and identity.
+    const cfg = lookup(model, STORE.SSH_CONFIG, h.ssh_config)
       || lookup(model, STORE.SSH_CONFIG2, h.ssh_config);
-    let portCfg = cfg, identRef = cfg && cfg.identity;
+    let inner = null;
     if (cfg && cfg.ssh_config && typeof cfg.ssh_config === 'object') {
-      const inner = lookup(model, STORE.SSH_CONFIG, cfg.ssh_config);
-      if (inner) { portCfg = inner; if (identRef == null) identRef = inner.identity; }
+      inner = lookup(model, STORE.SSH_CONFIG, cfg.ssh_config);
     }
+    const portCfg = inner || cfg;
     let port = portCfg && portCfg.port;
     if (port && typeof port === 'object') port = port.value ?? port.number ?? null;
     if (typeof port !== 'number' || !port) port = 22;
 
+    const identRef = (inner && inner.identity) || (cfg && cfg.identity);
     const ident = lookup(model, STORE.IDENTITY, identRef);
     const username = ident ? decryptField(ident.username, key) : '';
     const password = ident ? decryptField(ident.password, key) : '';

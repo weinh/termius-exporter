@@ -333,6 +333,26 @@ function buildHostRows(model, key) {
     const keyObj = lookup(model, STORE.KEY, ident && ident.ssh_key);
     if (keyObj) keyName = decryptField(keyObj.label, key) || keyObj.label || '';
 
+    // Resolve the host's group chain: host.group -> store15 group -> parent_group -> ...
+    // Build a "parent/child" path so nested groups survive import.
+    let groupPath = '';
+    if (h.group && typeof h.group === 'object') {
+      const parts = [];
+      let ref = h.group;
+      const visited = new Set();
+      while (ref && typeof ref === 'object') {
+        const refKey = ref.local_id != null ? ref.local_id : ref.id;
+        if (refKey == null || visited.has(refKey)) break;
+        visited.add(refKey);
+        const g = lookup(model, STORE.GROUP, ref);
+        if (!g) break;
+        const lbl = decryptField(g.label, key) || g.label || '';
+        if (lbl) parts.unshift(lbl);
+        ref = (g.parent_group && typeof g.parent_group === 'object') ? g.parent_group : null;
+      }
+      groupPath = parts.join('/');
+    }
+
     rows.push({
       label: decryptField(h.label, key) || h.label || '',
       host: decryptField(h.address, key) || h.address || '',
@@ -341,15 +361,16 @@ function buildHostRows(model, key) {
       password,
       keyName,
       os: decryptField(h.os_name, key) || h.os_name || '',
+      group: groupPath,
     });
   }
   return rows;
 }
 
 function exportHostsCsv(rows) {
-  let csv = 'Label,Host,Port,Username,Password,SSH_Key,OS\n';
+  let csv = 'Label,Host,Port,Username,Password,SSH_Key,OS,Group\n';
   rows.forEach(h => {
-    csv += [h.label, h.host, h.port, h.username, h.password, h.keyName, h.os].map(escapeCsv).join(',') + '\n';
+    csv += [h.label, h.host, h.port, h.username, h.password, h.keyName, h.os, h.group].map(escapeCsv).join(',') + '\n';
   });
   fs.writeFileSync(path.join(OUTPUT_DIR, 'termius_hosts.csv'), BOM + csv);
   return rows.length;

@@ -256,13 +256,12 @@ async function buildModel(key, debug) {
     }
     if (o.id != null && !idx.byId.has(o.id)) idx.byId.set(o.id, o);
   }
-  for (const [sid, idx] of byStore) {
-    // Gap-fill key-local_id records only for non-config stores. store4/store9 share a
-    // local_id space, so filling one from the key would intercept refs meant for the
-    // other and mis-resolve credentials.
-    if (sid !== STORE.SSH_CONFIG && sid !== STORE.SSH_CONFIG2) {
-      for (const [lid, obj] of idx.byKeyLocal) if (!idx.byLocal.has(lid)) idx.byLocal.set(lid, obj);
-    }
+  for (const idx of byStore.values()) {
+    // Some records carry local_id only in the LevelDB key (value.local_id is empty).
+    // Fill those into byLocal so refs resolve. Config records (store4) are often in
+    // this form and ARE the authoritative ssh_config (store9 is a stale wrapper), so
+    // they must be filled — lookup checks store4 before store9.
+    for (const [lid, obj] of idx.byKeyLocal) if (!idx.byLocal.has(lid)) idx.byLocal.set(lid, obj);
     idx.list = [...idx.byLocal.values(), ...idx.noLocal];
   }
 
